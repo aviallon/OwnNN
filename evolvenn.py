@@ -15,47 +15,106 @@ np.seterr(all='ignore')
 
 floatx = np.float32
 
-def linear(x):
-    return x
-
-def relu(x):
-    return np.maximum(0.0, x)
-
-def sigmoid(x):
-    return 1/(1+np.exp(-x))
-
-def hard_sigmoid(x):
-    return np.clip((x*0.2)+0.5, 0, 1) 
-
-def leaky_relu(x):
-    if x >= 0:
+class linear:
+    def __call__(self, x):
         return x
     
-    return 0.001*x
+    def deriv(self, x):
+        return 1
 
-def tanh(x):
-    return np.tanh(x)
+class relu:
+    def __call__(self, x):
+        return np.maximum(0.0, x)
+    
+    def deriv(self, x):
+        def _kernel(x):
+            if x <= 0:
+                return 0
+            else:
+                return 1
+            
+        return np.vectorize(_kernel)(x)
 
-def softmax(x):
-    xnew = x
-    try:
-        xnew = np.exp(x)/np.sum(np.exp(x))
-    except Exception as w:
-        print("Warning :", w)
+class sigmoid:
+    def __call__(self, x):
+        return 1/(1+np.exp(-x))
+    
+    def deriv(self, x):
+        return x*(1-x)
+
+class hard_sigmoid:
+    def __init__(self):
+        pass
+    
+    def __call__(self, x):
+        return np.clip((x*0.2)+0.5, 0, 1)
+    
+    def deriv(self, x):
+        def _kernel(x):
+            if x > -2.5 and x < 2.5:
+                return 1
+            else:
+                return 0
         
-    return xnew
+        return np.vectorize(_kernel)(x)
 
-def LeakyReLU(alpha=1e-3):
-    def func(x):
-        if x >= 0:
-            return x
-        else:
-            return alpha*x
+class tanh:
+    def __init__(self):
+        pass
+    
+    def __call__(self, x):
+        return np.tanh(x)
+    
+    def deriv(self, x):
+        return (1 - np.tanh(x)**2)
+
+class softmax:
+    def __call__(self, x):
+        xnew = x.copy()
+        try:
+            xnew = np.exp(x)/np.sum(np.exp(x))
+        except Exception as w:
+            print("Warning :", w)
+        return xnew
+    
+    def deriv(self, x):
+        raise(NotImplementedError("NNNOOOOOO DON'T USE SOFTMAX YET !"))
+
+class LeakyReLU:
+    def __init__(self, alpha=0.001):
+        self.alpha = alpha
+    
+    def __call__(self, x):
+        def _kernel(x):
+            if x >= 0:
+                return x
+            else:
+                return self.alpha*x
+            
+        return np.vectorize(_kernel)(x)
         
-    return func
+    def deriv(self, x):
+        def _kernel(x):
+            if x >= 0:
+                return 1
+            else:
+                return -self.alpha
+        
+        return np.vectorize(_kernel)(x)
+        
 
-def hard_tanh(x):
-    return np.clip(x, -1.0, 1.0)
+class hard_tanh:
+    def __call__(self, x):
+        return np.clip(x, -1.0, 1.0)
+    
+    def deriv(self, x):
+        def _kernel(x):
+            if x > -1 and x < 1:
+                return 1
+            else:
+                return 0
+        
+        return np.vectorize(_kernel)(x)
 
 class Layer:
     id_counter = 0
@@ -83,7 +142,7 @@ class Layer:
     def init(self, input_size:int):
         if self.trainable:
             self.M = np.random.normal(0, 1, (input_size, self.output_size)).astype(floatx)
-            self.bias = np.random.normal(0, 1, self.output_size).astype(floatx)
+            self.bias = np.random.normal(0, 1)
         self.input_size = input_size
         
     def __repr__(self):
@@ -189,6 +248,22 @@ class Sequential:
         y = pool.map(self.predict, x)
         return np.array(y)
     
+    
+    def train_batch(self, x:[np.array], loss:str, pool=None) -> [np.array]:
+        # Forward propagation
+        outputs = [x.copy()]
+        for l in self.layers:
+            try:
+                x = l.out(x)
+                outputs.append(x.copy())
+            except ValueError as e:
+                print(e, "in layer:", l)
+                raise(e)
+                
+        # Backward propagation
+        for i,l in enumerate(self.layers):
+            pass
+    
 class Evolution:
     def __init__(self, model:Sequential, numbers=50, bestN=8, compile=True):
         self.models = []
@@ -278,17 +353,16 @@ class Evolution:
                         M[index] = np.random.uniform(-1, 1)
                     elif np.random.random() < layer.lr:
                         M[index] += np.random.uniform(-lr_qty, lr_qty)
-                        
-                for (index, val) in np.ndenumerate(bias):
-                    if np.random.random() > 0.5:
-                        bias[index] = parent1.layers[i].get_bias()[index]
-                    else:
-                        bias[index] = parent2.layers[i].get_bias()[index]
-                    
-                    if np.random.random() < layer.lr2:
-                        bias[index] = np.random.uniform(-1, 1)
-                    elif np.random.random() < layer.lr:
-                        bias[index] += np.random.uniform(-lr_qty, lr_qty)
+                
+                if np.random.random() > 0.5:
+                    bias = parent1.layers[i].get_bias()
+                else:
+                    bias = parent2.layers[i].get_bias()
+                
+                if np.random.random() < layer.lr2:
+                    bias = np.random.uniform(-1, 1)
+                elif np.random.random() < layer.lr:
+                    bias += np.random.uniform(-lr_qty, lr_qty)
                 
                 layer.set_weights(M, bias)
                 

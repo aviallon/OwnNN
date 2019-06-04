@@ -10,19 +10,35 @@ import copy
 import time
 import numpy as np
 from multiprocessing import Pool, Process, cpu_count
+import os
+import sys
+#os.environ['OPENBLAS_NUM_THREADS'] = '1'
 
 np.seterr(all='ignore')
 
 floatx = np.float32
 
-class linear:
+class Activation:
+    def __init__(self):
+        self.__name__ = "Activation"
+    
+    def __call__(self, x):
+        pass
+    
+    def deriv(self, x):
+        pass
+    
+class linear(Activation):
     def __call__(self, x):
         return x
     
     def deriv(self, x):
         return 1
+    
+    def __init__(self):
+        self.__name__ = "linear"
 
-class relu:
+class relu(Activation):
     def __call__(self, x):
         return np.maximum(0.0, x)
     
@@ -34,18 +50,22 @@ class relu:
                 return 1
             
         return np.vectorize(_kernel)(x)
+    
+    def __init__(self):
+        self.__name__ = "relu"
 
-class sigmoid:
+class sigmoid(Activation):
     def __call__(self, x):
         return 1/(1+np.exp(-x))
     
     def deriv(self, x):
-        return x*(1-x)
-
-class hard_sigmoid:
-    def __init__(self):
-        pass
+        sig_x = self.__call__(x)
+        return sig_x*(1-sig_x)
     
+    def __init__(self):
+        self.__name__ = "sigmoid"
+
+class hard_sigmoid(Activation):
     def __call__(self, x):
         return np.clip((x*0.2)+0.5, 0, 1)
     
@@ -57,18 +77,24 @@ class hard_sigmoid:
                 return 0
         
         return np.vectorize(_kernel)(x)
-
-class tanh:
-    def __init__(self):
-        pass
     
+    def __init__(self):
+        self.__name__ = "hard_sigmoid"
+
+class tanh(Activation):
     def __call__(self, x):
         return np.tanh(x)
     
     def deriv(self, x):
         return (1 - np.tanh(x)**2)
+    
+    def __init__(self):
+        self.__name__ = "tanh"
 
-class softmax:
+class softmax(Activation):
+    def __init__(self):
+        self.__name__ = "softmax"
+    
     def __call__(self, x):
         xnew = x.copy()
         try:
@@ -80,9 +106,10 @@ class softmax:
     def deriv(self, x):
         raise(NotImplementedError("NNNOOOOOO DON'T USE SOFTMAX YET !"))
 
-class LeakyReLU:
+class LeakyReLU(Activation):
     def __init__(self, alpha=0.001):
         self.alpha = alpha
+        self.__name__ = "LeakyReLU({})".format(alpha)
     
     def __call__(self, x):
         def _kernel(x):
@@ -103,7 +130,10 @@ class LeakyReLU:
         return np.vectorize(_kernel)(x)
         
 
-class hard_tanh:
+class hard_tanh(Activation):
+    def __init__(self):
+        self.__name__ = "hard_tanh"
+    
     def __call__(self, x):
         return np.clip(x, -1.0, 1.0)
     
@@ -115,14 +145,34 @@ class hard_tanh:
                 return 0
         
         return np.vectorize(_kernel)(x)
+    
+class Loss:
+    def __call__(self, y_true, y_pred) -> float:
+        pass
+    
+    def deriv(self, y_true, y_pred) -> float:
+        pass
+
+class mean_squared_error(Loss):
+    def __call__(self, y_true, y_pred) -> float:
+        return float(np.sum((y_true - y_pred)**2, axis=None)/len(y_true))
+    
+    def deriv(self, y_true, y_pred) -> float:
+        return y_true - y_pred
+
+class categorical_xtropy(Loss):
+    def __call__(self, y_true, y_pred):
+        #print("XTROPY:", y_true.shape, y_pred.shape)
+        return -np.sum(y_true*np.log(y_pred), axis=None)/y_true.shape[0]
 
 class Layer:
     id_counter = 0
-    def __init__(self, output_size:int, activation=linear, lr = 1e-2, lr2 = 1e-3, trainable = True, use_bias=False):
+    def __init__(self, output_size:int, activation=linear, lr = 1e-3, lr2 = 1e-4, lr_bias = 1e-4, trainable = True, use_bias=False):
         self.output_size = output_size
         self.activation = activation
         self.lr = lr
         self.lr2 = lr2
+        self.lr_bias = lr_bias
         self.trainable = trainable
         self.use_bias = use_bias
         self.uid = Layer.id_counter
@@ -157,17 +207,23 @@ class Layer:
     def set_weights(self, M, bias=None):
         if M.shape == self.M.shape:
             self.M = M
-            if bias is None:
+            if not(bias is None):
                 self.bias = bias
         else:
             raise ValueError("New weights do not have the same shape !!! ({} versus {})".format(M.shape, self.M.shape))
+            
+    def set_bias(self, bias):
+        self.bias = bias
     
 class Dense(Layer):
-    def __init__(self, output_size:int, activation=linear, lr = 1e-2, lr2 = 1e-3, trainable = True, use_bias = True):
-        Layer.__init__(self, output_size, activation, lr, lr2, trainable)
+    def __init__(self, output_size:int, activation=linear, lr = 1e-2, lr2 = 1e-3, lr_bias=1e-6, bias_only = False, trainable = True, use_bias = True):
+        Layer.__init__(self, output_size, activation, lr, lr2, lr_bias, trainable, use_bias)
+        self.bias_only = bias_only
         self.name = "Dense"
     
     def out(self, x:np.array) -> np.array:
+        if self.bias_only:
+            return self.activation(np.ones((1, self.output_size))*self.bias)
         if self.use_bias:
             return self.activation(np.dot(x, self.M) + self.bias)
         else:
@@ -187,14 +243,19 @@ class Flatten(Layer):
     
 class Sequential:
     id_counter = 0
-    def __init__(self, input_size:int, output_size:int, layers=[]):
+    def __init__(self, input_size:int, output_size:int, layers=[], compile=True, debug=False):
         self.input_size = input_size
         self.output_size = output_size
         self.layers = layers
         self.uid = Sequential.id_counter
         Sequential.id_counter += 1
-        self.loss = np.inf
-        self.debug = False
+        self.losses = [np.inf]
+        self.val_loss = np.inf
+        self.history = {}
+        self.debug = debug
+        self.clipnorm = 1.0
+        if compile:
+            self.compile()
         
     def newid(self):
         self.uid = Sequential.id_counter
@@ -240,16 +301,19 @@ class Sequential:
                 raise(e)
         return x.flatten()
     
-    def predict_batch(self, x:[np.array], pool=None, debug=False) -> [np.array]:
-        self.debug = debug
+    def predict_batch(self, x:[np.array], pool=Pool(4)) -> [np.array]:
+        y = []
         if pool is None:
-            pool = Pool(4)
-        
-        y = pool.map(self.predict, x)
+            if self.debug:
+                print("No multithreading", file=sys.stderr)
+            for el in x:
+                y.append(self.predict(el))
+        else:
+            y = pool.map(self.predict, x)
         return np.array(y)
     
     
-    def train_batch(self, x:[np.array], loss:str, pool=None) -> [np.array]:
+    def train_online(self, x:np.array, y:np.array, loss:Loss):
         # Forward propagation
         outputs = [x.copy()]
         for l in self.layers:
@@ -260,9 +324,106 @@ class Sequential:
                 print(e, "in layer:", l)
                 raise(e)
                 
+        self.losses.append(loss(y, outputs[-1]))
+        if self.debug:
+            #print("\t\t\t--------", self.loss)
+            print(outputs)
+                
         # Backward propagation
-        for i,l in enumerate(self.layers):
-            pass
+        
+        # Calcul des erreurs
+        deltas = [0]*len(self.layers)
+        l = len(self.layers) - 1
+        while l >= 0:
+            errors = np.zeros(self.layers[l].M.shape[1]+1)
+            for i in range(self.layers[l].M.shape[1]):
+                delta = 0
+                if l != len(self.layers) - 1:
+                    if self.debug:
+                        print(deltas[l+1])
+                    for neurone in range(self.layers[l+1].M.shape[1]): # Nombre de sorties
+                        delta += self.layers[l+1].M[i, neurone] * deltas[l+1][neurone]
+                    
+                    delta += self.layers[l+1].bias
+                else:
+                    delta = loss.deriv(y[i], outputs[l+1][i]) # On a n plus un outputs (ne pas oublier la couche d'entrée !)
+                    
+                delta *= self.layers[l].activation.deriv(outputs[l+1][i])
+                errors[i] = delta
+            
+            # BIAS TRAINING:
+            delta = 0
+            if l != len(self.layers) - 1:
+                for neurone, val in np.ndenumerate(self.layers[l+1].M):
+                    delta += self.layers[l+1].M[neurone] * deltas[l+1][neurone[1]]
+            else:
+                for i in range(len(y)):
+                    delta += loss.deriv(y[i], outputs[l+1][i])
+            
+            for i in range(len(outputs[l+1])):
+                delta *= self.layers[l].activation.deriv(outputs[l+1][i])
+            errors[-1] = delta
+            
+                
+            deltas[l] = errors
+            l -= 1
+            
+        # Entrainement
+        for l in range(len(self.layers)):
+            for poids, val in np.ndenumerate(self.layers[l].M):
+                dErr_dweight = self.layers[l].lr * deltas[l][poids[1]]
+                if l != len(self.layers) - 1:
+                    dErr_dweight *= outputs[l][poids[0]]
+                
+                if abs(dErr_dweight) > self.clipnorm:
+                    dErr_dweight = np.sign(dErr_dweight)*self.clipnorm
+                self.layers[l].M[poids] += dErr_dweight
+                
+            dErr_dbias = self.layers[l].lr_bias * deltas[l][-1]
+            if abs(dErr_dbias) > self.clipnorm:
+                    dErr_dbias = np.sign(dErr_dbias)*self.clipnorm
+                    
+            self.layers[l].bias += dErr_dbias
+        
+    def train(self, X:[np.array], Y:[np.array], loss=Loss, epochs=100, validation_split=0.1):
+        ntrain = int((1-validation_split)*len(X))
+        Xtrain = X[:ntrain]
+        Ytrain = Y[:ntrain]
+        Xval = X[ntrain:]
+        Yval = Y[ntrain:]
+        self.history = {"loss":[np.inf], "val_loss":[np.inf], "epoch":[0]}
+        for epoch in range(1, epochs+1):
+            self.losses = []
+            rng_state = np.random.get_state()
+            np.random.shuffle(Xtrain)
+            np.random.set_state(rng_state)
+            np.random.shuffle(Ytrain)
+            for i in range(len(Xtrain)):
+                self.train_online(Xtrain[i].copy(), Ytrain[i].copy(), loss)
+                if self.debug:
+                    time.sleep(1)
+            for i in range(len(Xtrain)-1,0,-1):
+                self.train_online(Xtrain[i].copy(), Ytrain[i].copy(), loss)
+            
+            train_loss = np.mean(self.losses)
+            
+            Yval_pred = self.predict_batch(Xval, pool=None)
+            self.val_loss = loss(Yval, Yval_pred)
+            self.history['loss'].append(train_loss)
+            self.history["val_loss"].append(self.val_loss)
+            self.history['epoch'].append(epoch)
+            print("Epoch {} - loss = {}, val_loss= {}".format(epoch, train_loss, self.val_loss))
+        
+    def plot_history(self):
+        import matplotlib.pyplot as plt
+        plt.close()
+        plt.plot(self.history['epoch'], self.history['loss'], label='loss')
+        plt.plot(self.history['epoch'], self.history['val_loss'], label='val_loss')
+        plt.xlabel("Epoch")
+        plt.ylabel("Loss")
+        plt.grid()
+        plt.legend()
+        plt.show()
     
 class Evolution:
     def __init__(self, model:Sequential, numbers=50, bestN=8, compile=True):
@@ -282,13 +443,13 @@ class Evolution:
         self.history = []
         self.lr_qty = 1.0
     
-    def evolve_batch(self, loss:callable, generator:callable, x:[np.array], y:[np.array], lr_qty = 1e-3, pool = None):
+    def evolve_batch(self, loss:Loss, generator:callable, x:[np.array], y:[np.array], lr_qty = 1e-3, pool = None):
         
         if pool is None:
             pool = Pool(4)
             
         for i, model in enumerate(self.models):
-            y_pred = model.predict_batch(x, pool, debug=False)
+            y_pred = model.predict_batch(x, pool)
             self.models[i].loss = loss([y, y_pred])
     
         self.models, best_loss = generator(self.models, self.numbers, self.bestN, lr_qty, pool = pool)
@@ -386,15 +547,6 @@ class Evolution:
     def predict_best(self, X:np.array) -> np.array:
         self.models = sorted(self.models, key=lambda model: model.loss)
         return np.array(self.models[0].predict_batch(X))
-
-def mean_squared_error(Y:[np.array]) -> float:
-    y_true, y_pred = Y[0], Y[1]
-    return float(np.sum((y_true - y_pred)**2, axis=None)/np.size(y_true))
-
-def categorical_xtropy(Y:[np.array]) -> float:
-    y_true, y_pred = Y[0], Y[1]
-    #print("XTROPY:", y_true.shape, y_pred.shape)
-    return -np.sum(y_true*np.log(y_pred), axis=None)/y_true.shape[0]
 
 
 def to_categorical(labels, n_vec=None):

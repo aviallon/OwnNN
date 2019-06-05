@@ -199,8 +199,8 @@ class Adam(Optimizer):
     def init(self, layers):
         for l in range(len(layers)):
             if layers[l].trainable:
-                self.moving_avg_grad.append(np.zeros(layers[l].M.shape, dtype=floatx))
-                self.moving_avg_squared_grad.append(np.zeros(layers[l].M.shape, dtype=floatx))
+                self.moving_avg_grad.append(np.zeros(layers[l].getW().shape, dtype=floatx))
+                self.moving_avg_squared_grad.append(np.zeros(layers[l].getW().shape, dtype=floatx))
                 self.moving_avg_grad_bias.append(floatx(0))
                 self.moving_avg_squared_grad_bias.append(floatx(0))
             else:
@@ -273,7 +273,7 @@ class Layer:
         self.standard = True
         self.name = "Layer"
     
-    def out(self, x:np.array, training=False) -> np.array:
+    def out(self, x:np.array) -> np.array:
         pass
     
     def newid(self):
@@ -286,7 +286,7 @@ class Layer:
     def __repr__(self):
         return "{}(input_size = {}, output_size = {}, activation={}, trainable={})".format(self.name, self.input_size, self.output_size, self.activation.__name__, self.trainable)
     
-    def get_weights(self):
+    def getW(self):
         return self.M
 
     def get_bias(self):
@@ -298,17 +298,25 @@ class Layer:
             if not(bias is None):
                 self.bias = bias
         else:
-            raise ValueError("New weights do not have the same shape !!! ({} versus {})".format(M.shape, self.M.shape))
+            raise ValueError("New weights do not have the same shape !!! ({} versus {})".format(M.shape, self.getW().shape))
             
     def set_bias(self, bias):
         self.bias = bias
+        
+    def getNeuronDisabled(self, neuron):
+        return False
+    
+    def step(self, feedforward=False, backpropagation=False):
+        pass
     
 class Dense(Layer):
-    def __init__(self, output_size:int, activation=linear, lr = 1e-3, lr2 = 1e-3, lr_bias=1e-6, bias_only = False, trainable = True, use_bias = True, init_weights = None, init_bias=None):
+    def __init__(self, output_size:int, activation=linear, lr = 1e-3, lr2 = 1e-3, lr_bias=1e-6, dropout=0, bias_only = False, trainable = True, use_bias = True, init_weights = None, init_bias=None):
         Layer.__init__(self, output_size, activation, lr, lr2, lr_bias, trainable, use_bias)
         self.bias = 0
         self.bias_only = bias_only
         self.name = "Dense"
+        self.dropout = dropout
+        self.dropouts = np.eye(output_size, dtype=floatx)
         if not(init_bias is None):
             self.bias = init_bias
         if not(init_weights is None):
@@ -319,14 +327,27 @@ class Dense(Layer):
             self.M = np.random.normal(0, 1, (input_size, self.output_size)).astype(floatx)
             self.bias = np.random.normal(0, 1)
         self.input_size = input_size
+        
+    def getW(self):
+        return self.M.dot(self.dropouts)
     
-    def out(self, x:np.array, training=False) -> np.array:
+    def step(self, feedforward=False, backpropagation=False):
+        if feedforward:
+            for i in range(self.output_size):
+                self.dropouts = np.random.choice([0, 1], p=[self.dropout, 1-self.dropout])
+                
+            self.dropouts *= (1-self.dropout)
+        else:
+            self.dropouts = np.eye(self.output_size, dtype=floatx)
+    
+    def out(self, x:np.array) -> np.array:
+                
         if self.bias_only:
             return self.activation(np.ones((1, self.output_size))*self.bias)
         if self.use_bias:
-            return self.activation(np.dot(x, self.M) + self.bias)
+            return self.activation(np.dot(x, self.getW()) + self.bias)
         else:
-            return self.activation(np.dot(x, self.M))
+            return self.activation(np.dot(x, self.getW()))
         
 class Flatten(Layer):
     def __init__(self, output_size:int):
@@ -349,19 +370,21 @@ class Dropout(Layer):
         self.alpha = alpha
         self.activation = linear()
         self.standard = False
+        raise DeprecationWarning('Dropout layer doesn\'t work well. Please do not use it.')
         
     def init(self, input_size:int, previous_size:int):
         self.output_size = previous_size
         self.input_size = previous_size
-    
-    def out(self, x:np.array, training=False) -> np.array:
-        if training:
-            self.M = np.eye(self.input_size, dtype=floatx)
+        
+    def step(self, feedforward=False, backpropagation=False):
+        self.M = np.eye(self.input_size, dtype=floatx)
+        if backpropagation:
             for i in range(self.M.shape[0]):
                 self.M[i,i] = np.random.choice([0, 1], p=[self.alpha, 1-self.alpha])
-            return x*self.M
-        else:
-            return x*self.alpha
+            self.M *= (1-self.alpha)
+            
+    def out(self, x:np.array) -> np.array:
+        return self.M
     
 class Sequential:
     id_counter = 0
@@ -413,18 +436,24 @@ class Sequential:
         m += "========\n"
         return m
         
-    def predict(self, x:np.array) -> np.array:
+    def predict(self, x:np.array, return_outputs=False) -> np.array:
         if self.debug:
             print("Predict input ",x.shape)
+        outputs = [x.copy().flatten()]
         for l in self.layers:
             try:
                 x = l.out(x)
+                if return_outputs:
+                    outputs.append(x.copy().flatten())
             except ValueError as e:
                 print(e, " in layer :",l)
                 raise(e)
+                
+        if return_outputs:
+            return outputs
         return x.flatten()
     
-    def predict_batch(self, x:[np.array], pool=Pool(4)) -> [np.array]:
+    def predict_batch(self, x:[np.array], pool=None) -> [np.array]:
         y = []
         if pool is None:
             if self.debug:
@@ -441,92 +470,96 @@ class Sequential:
             lnext += 1
         return lnext
     
-    def train_online(self, x:np.array, y:np.array, loss:Loss, optimizer:Optimizer, weight_decay=1e-5):
-        # Forward propagation
-        outputs = [x.copy().flatten()]
-        for l in self.layers:
-            try:
-                x = l.out(x, training=True)
-                outputs.append(x.copy().flatten())
-            except ValueError as e:
-                print(e, "in layer:", l)
-                raise(e)
+    @staticmethod
+    def _error_calculation(layers, outputs, y, loss):
+        try:
+            deltas = np.array([np.zeros(layers[l].getW().shape[1]+1) for l in range(len(layers))])
+            l = len(layers)
+            while l > 0:
+                l -= 1
                 
-        self.losses.append(loss(y, outputs[-1]))
-        if self.debug:
-            #print("\t\t\t--------", self.loss)
-            print(outputs)
+                if layers[l].trainable == False:
+                    continue
+                
+                l_next = l+1
+                
+                for i in range(layers[l].getW().shape[1]):
+                    delta = 0
+                    if l != len(layers) - 1:
+                        for neurone in range(layers[l_next].getW().shape[1]): # Nombre de sorties
+                            delta += layers[l_next].getW()[i, neurone] * deltas[l_next][neurone]
+                        
+                        delta += layers[l_next].bias
+                    else:
+                        delta = loss.deriv(y[i], outputs[l_next][i]) # On a n plus un outputs (ne pas oublier la couche d'entrée !)
+                        
+    
+                    delta *= layers[l].activation.deriv(outputs[l_next][i])
+                    deltas[l][i] += delta
+                
+                # bias training
+                delta = 0
+                if layers[l].use_bias:
+                    if l != len(layers) - 1:
+                        for neurone, val in np.ndenumerate(layers[l_next].getW()): # Here, bias influences **ALL** the next neurons, on all their weights
+                            delta += layers[l_next].getW()[neurone] * deltas[l_next][neurone[1]]
+                    else:
+                        for i in range(len(y)): # Same for outputs
+                            delta += loss.deriv(y[i], outputs[l_next][i])
+                    
+                    for i in range(len(outputs[l_next])):
+                        delta *= layers[l].activation.deriv(outputs[l_next][i])
+                        
+                deltas[l][-1] += delta
+                
+            return deltas
+        except KeyboardInterrupt:
+            pass
+    
+    def train_batch(self, X:[np.array], Y:[np.array], loss:Loss, pool:Pool, optimizer:Optimizer, weight_decay=1e-5):
+        
+        batch_size = len(X)
+        
+        for l in self.layers:
+            l.step(feedforward=True)
+        
+        # Forward propagation
+        batches_outputs = []
+        for step in range(batch_size):
+            outputs = self.predict(X[step], return_outputs=True)
+            self.losses.append(loss(Y[step], outputs[-1]))
+            batches_outputs.append(outputs)
                 
         # Backward propagation
         
         # Calcul des erreurs
-        deltas = [0]*len(self.layers)
-        l = len(self.layers)
-        while l > 0:
-            l -= 1
-            if self.layers[l].trainable == False:
-                continue
+        for l in range(len(self.layers)):
+            self.layers[l].step(backpropagation=True)
+        
+        batch_deltas = [0]*batch_size
+        for step in range(batch_size):
+            batch_deltas[step] = pool.apply_async(Sequential._error_calculation, args=(self.layers, batches_outputs[step], Y[step], loss))
             
-            l_next = self.get_next_layer(l)
-            
-            errors = np.zeros(self.layers[l].M.shape[1]+1)
-            for i in range(self.layers[l].M.shape[1]):
-                delta = 0
-                if l != len(self.layers) - 1:
-                    #if self.debug:
-                    #    print(deltas[l+1])
-                    for neurone in range(self.layers[l_next].M.shape[1]): # Nombre de sorties
-                        if self.debug:
-                            pass
-                            #print(l, self.layers[l+1].M)
-                            #print("Deltas[l+1]=",deltas[l+1])
-                        delta += self.layers[l_next].M[i, neurone] * deltas[l_next][neurone]
-                    
-                    delta += self.layers[l_next].bias
-                else:
-                    delta = loss.deriv(y[i], outputs[l_next][i]) # On a n plus un outputs (ne pas oublier la couche d'entrée !)
-                    
-#                if self.debug:
-#                    print("PREV", l, delta)
-                    
-                delta *= self.layers[l].activation.deriv(outputs[l_next][i])
-#                if self.debug:
-#                    print(l, delta)
-#                    print("OUTPUTS : ",outputs)
-                errors[i] = delta
-            
-            # bias training
-            delta = 0
-            if self.layers[l].use_bias:
-                if l != len(self.layers) - 1:
-                    for neurone, val in np.ndenumerate(self.layers[l_next].M): # Here, bias influences **ALL** the next neurons, on all their weights
-                        delta += self.layers[l_next].M[neurone] * deltas[l_next][neurone[1]]
-                else:
-                    for i in range(len(y)): # Same for outputs
-                        delta += loss.deriv(y[i], outputs[l_next][i])
-                
-                for i in range(len(outputs[l_next])):
-                    delta *= self.layers[l].activation.deriv(outputs[l_next][i])
-            errors[-1] = delta
-            
-                
-            deltas[l] = errors
+        deltas = np.array([np.zeros(self.layers[l].getW().shape[1]+1) for l in range(len(self.layers))])
+        for step in range(batch_size):
+            deltas += batch_deltas[step].get()
             
         # Entrainement
         for l in range(len(self.layers)):
             if self.layers[l].trainable == False:
                 continue
             
-            for poids, val in np.ndenumerate(self.layers[l].M):
+            for poids, val in np.ndenumerate(self.layers[l].getW()):
                 dErr_dweight = - deltas[l][poids[1]]
                 if l != len(self.layers) - 1:
-                    dErr_dweight *= outputs[l][poids[0]]
+                    for step in range(batch_size):
+                        dErr_dweight *= batches_outputs[step][l][poids[0]]
                 
                 if abs(dErr_dweight) > self.clipnorm:
                     dErr_dweight = np.sign(dErr_dweight)*self.clipnorm
                     
                 dErr_dweight = optimizer.optimize(l, poids, val, dErr_dweight)
-                self.layers[l].M[poids] -= dErr_dweight - self.layers[l].lr * weight_decay * self.layers[l].M[poids]
+                self.layers[l].getW()[poids] -= dErr_dweight + self.layers[l].lr * weight_decay * self.layers[l].getW()[poids]
             
             if self.layers[l].use_bias:
                 dErr_dbias = - deltas[l][-1]
@@ -534,54 +567,72 @@ class Sequential:
                         dErr_dbias = np.sign(dErr_dbias)*self.clipnorm
                 
                 dErr_dbias = optimizer.optimize_bias(l, self.layers[l].bias, dErr_dbias)
-                self.layers[l].bias -= dErr_dbias - self.layers[l].lr * weight_decay * self.layers[l].bias
+                self.layers[l].bias -= dErr_dbias + self.layers[l].lr * weight_decay * self.layers[l].bias
                 
         optimizer.step(self.debug)
         
-    def train(self, X:[np.array], Y:[np.array], optimizer:Optimizer, loss=mean_squared_error(), epochs=100, validation_split=0.1, weight_decay=1e-4, patience=10, lr_decay=1e-4, shuffle=True, resume=True):
+    def train(self, X:[np.array], Y:[np.array], optimizer:Optimizer, loss=mean_squared_error(), batch_size=1, epochs=100, validation_split=0.1, weight_decay=1e-4, patience=10, lr_decay=1e-3, shuffle=True, resume=True):
         ntrain = int((1-validation_split)*len(X))
-        Xtrain = X[:ntrain]
-        Ytrain = Y[:ntrain]
-        Xval = X[ntrain:]
-        Yval = Y[ntrain:]
+        Xtrain = np.array(X[:ntrain])
+        Ytrain = np.array(Y[:ntrain])
+        Xval = np.array(X[ntrain:])
+        Yval = np.array(Y[ntrain:])
         optimizer.init(self.layers)
+        pool = Pool(4)
         if not(resume) or self.last_epoch == 0:
             self.best_epoch = 0
             self.counter_since_best = 0
             self.best_layers = copy.deepcopy(self.layers)
             self.history = {"loss":[np.inf], "val_loss":[self.val_loss], "epoch":[0], "lr":[optimizer.lr]}
-            self.resume = 0
+            resume = 0
         else:
+            print("Resuming at epoch {}".format(self.last_epoch+1))
             resume = self.last_epoch
         for epoch in range(resume+1, epochs+1):
+            #print(epoch)
             try:
                 self.losses = []
+                indices = np.arange(Xtrain.shape[0])
                 if shuffle:
-                    rng_state = np.random.get_state()
-                    np.random.shuffle(Xtrain)
-                    np.random.set_state(rng_state)
-                    np.random.shuffle(Ytrain)
-                for i in range(len(Xtrain)):
-                    self.train_online(Xtrain[i].copy(), Ytrain[i].copy(), loss, optimizer=optimizer, weight_decay=weight_decay)
+                    np.random.shuffle(indices)
+                num_batch = len(Xtrain) // batch_size
+                for batch in range(num_batch):
+                    t0 = time.time_ns()
+                    index = batch*batch_size
+#                    if batch*batch_size >= len(Xtrain):
+#                        index = len(Xtrain) - (batch+1)*batch_size
+#                        
+#                    print(index)
+                        
+                    excerpt = indices[index:index+batch_size]
+                                  
+                    self.train_batch(Xtrain[excerpt], Ytrain[excerpt], loss, pool=pool, optimizer=optimizer, weight_decay=weight_decay)
+                    
                     if self.debug:
                         time.sleep(3)
-                for i in range(len(Xtrain)-1,0,-1):
-                    self.train_online(Xtrain[i].copy(), Ytrain[i].copy(), loss, optimizer=optimizer, weight_decay=weight_decay)
+                    
+                    dt = (time.time_ns() - t0)/1e9
+                    
+                    print("\r\t => Batch {}/{} - {} batch/s".format(batch+1, num_batch, np.round(1/dt, decimals=3)), end=" "*10)
+                
+                print("")
                 
                 train_loss = np.mean(self.losses)
-                
-                Yval_pred = self.predict_batch(Xval, pool=None)
                 
                 optimizer.lr = (1-lr_decay)*optimizer.lr + lr_decay*optimizer.lr/np.sqrt(epoch)
                 optimizer.lr_bias = (1-lr_decay)*optimizer.lr_bias + lr_decay*optimizer.lr_bias/np.sqrt(epoch)
                 
+                Yval_pred = self.predict_batch(Xval, pool=None)
                 self.val_loss = loss(Yval, Yval_pred)
                 
                 self.history['loss'].append(train_loss)
                 self.history["val_loss"].append(self.val_loss)
                 self.history['epoch'].append(epoch)
                 self.history['lr'].append(optimizer.lr)
-                print("Epoch {} - loss = {}, val_loss= {}".format(epoch, train_loss, self.val_loss))
+                best_message = ""
+                if self.val_loss < self.history['val_loss'][self.best_epoch]:
+                    best_message = " - ★"
+                print("Epoch {} - loss = {}, val_loss = {}{}".format(epoch, train_loss, self.val_loss, best_message))
                 
                 if self.val_loss < self.history['val_loss'][self.best_epoch]:
                     self.best_epoch = epoch
@@ -597,13 +648,23 @@ class Sequential:
                         print("Loss not improving after {} epochs, stopping here".format(self.counter_since_best))
                         print("Restoring best weights from epoch {}...".format(self.best_epoch))
                         self.layers = copy.deepcopy(self.best_layers)
+                        Yval_pred = self.predict_batch(Xval, pool=None)
                         self.val_loss = loss(Yval, Yval_pred)
                         print("Loss : {}".format(self.val_loss))
                         break
                     
                 self.last_epoch = epoch
             except KeyboardInterrupt: # In case of forced shutdown, we restore the network to its best state
-                print("Restoring best weights before shutdown...", file=sys.stderr)
+                try:
+                    pool.close()
+                    pool.join()
+                except KeyboardInterrupt:
+                    try:
+                        pool.terminate()
+                    except KeyboardInterrupt:
+                        print("Wait a few secs please !")
+                    
+                print("\nRestoring best weights before shutdown...", file=sys.stderr)
                 self.layers = copy.deepcopy(self.best_layers)
                 self.last_epoch = self.best_epoch
                 self.val_loss = self.history['val_loss'][self.best_epoch]
@@ -611,6 +672,7 @@ class Sequential:
                 del(self.history['loss'][self.best_epoch+1:])
                 del(self.history['lr'][self.best_epoch+1:])
                 del(self.history['epoch'][self.best_epoch+1:])
+                
                 break
         
     def plot_history(self, logarithmic_scale=False):
@@ -705,7 +767,7 @@ class Evolution:
                 if not(layer.trainable):
                     continue
                 
-                M = layer.get_weights()
+                M = layer.getW()
                 bias = layer.get_bias()
                 
                 for (index, val) in np.ndenumerate(M):
@@ -729,12 +791,13 @@ class Evolution:
                 elif np.random.random() < layer.lr:
                     bias += np.random.uniform(-lr_qty, lr_qty)
                 
-                layer.set_weights(M, bias)
                 
             return model
         
     @staticmethod
-    def genetic(models:[Sequential], number:int, bestN:int, lr_qty:float, pool = Pool(4), mt = True):
+    def genetic(models:[Sequential], number:int, bestN:int, lr_qty:float, pool = None, mt = True):
+        if pool is None:
+            pool = Pool(4)
         models = sorted(models, key=lambda model: model.loss)
         #print(models[0].loss, models[-1].loss)
         bests = models[:bestN]

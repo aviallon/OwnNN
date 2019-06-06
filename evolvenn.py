@@ -324,8 +324,9 @@ class Dense(Layer):
             
     def init(self, input_size:int, previous_size:int):
         if self.trainable:
-            self.M = np.random.normal(0, 1, (input_size, self.output_size)).astype(floatx)
-            self.bias = np.random.normal(0, 1)
+            n = (input_size+self.output_size)/2
+            self.M = np.random.normal(0, 1/n, (input_size, self.output_size)).astype(floatx)
+            self.bias = floatx(np.random.normal(0, 1/n))
         self.input_size = input_size
         
     def getW(self):

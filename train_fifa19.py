@@ -93,10 +93,10 @@ except Exception:
     pass
 
 model = Sequential(input_size=len(ok), output_size=1, layers=[
-        Dense(80, activation=LeakyReLU(), dropout=0.5),
-        Dense(32, activation=LeakyReLU(), dropout=0.25),
+        #Dense(80, activation=LeakyReLU(), dropout=0.5),
+        Dense(40, activation=LeakyReLU(), dropout=0.5),
         Dense(16, activation=LeakyReLU(), dropout=0.25),
         Dense(1, activation=linear())
         ])
 
-model.train(X.get_values()[:3000], Y.get_values()[:3000], batch_size=10, optimizer=Adam(epsilon=0.00001, lr=0.004), epochs=300, patience=15, lr_decay=1e-3)
+model.train(X.get_values()[:3000], Y.get_values()[:3000], batch_size=10, optimizer=Adam(epsilon=0.00001, lr=0.0001), epochs=300, patience=15, lr_decay=1e-3)

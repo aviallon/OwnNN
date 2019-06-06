@@ -436,21 +436,17 @@ class Sequential:
         m += "========\n"
         return m
         
-    def predict(self, x:np.array, return_outputs=False) -> np.array:
+    
+    def predict(self, x:np.array) -> np.array:
         if self.debug:
             print("Predict input ",x.shape)
-        outputs = [x.copy().flatten()]
         for l in self.layers:
             try:
                 x = l.out(x)
-                if return_outputs:
-                    outputs.append(x.copy().flatten())
             except ValueError as e:
                 print(e, " in layer :",l)
                 raise(e)
                 
-        if return_outputs:
-            return outputs
         return x.flatten()
     
     def predict_batch(self, x:[np.array], pool=None) -> [np.array]:
@@ -471,7 +467,20 @@ class Sequential:
         return lnext
     
     @staticmethod
-    def _error_calculation(layers, outputs, y, loss):
+    def _predict(i, layers, x:np.array) -> np.array:
+        outputs = [x.copy().flatten()]
+        for l in layers:
+            try:
+                x = l.out(x)
+                outputs.append(x.copy().flatten())
+            except ValueError as e:
+                print(e, " in layer :",l)
+                raise(e)
+                
+        return i, outputs
+    
+    @staticmethod
+    def _error_calculation(i, layers, outputs, y, loss):
         try:
             deltas = np.array([np.zeros(layers[l].getW().shape[1]+1) for l in range(len(layers))])
             l = len(layers)
@@ -524,25 +533,31 @@ class Sequential:
             l.step(feedforward=True)
         
         # Forward propagation
-        batches_outputs = []
+        workers = [0]*batch_size
         for step in range(batch_size):
-            outputs = self.predict(X[step], return_outputs=True)
-            self.losses.append(loss(Y[step], outputs[-1]))
-            batches_outputs.append(outputs)
+            workers[step] = pool.apply_async(Sequential._predict, args=(step, self.layers, X[step]))
+        
+        batches_outputs = [0]*batch_size
+        for step in range(batch_size):
+            i, output = workers[step].get() # Needed because return order is not guaranteed !
+            batches_outputs[i] = output
+            self.losses.append(loss(Y[i], batches_outputs[i][-1]))
                 
         # Backward propagation
         
         # Calcul des erreurs
+        
         for l in range(len(self.layers)):
             self.layers[l].step(backpropagation=True)
         
-        batch_deltas = [0]*batch_size
+        workers = [0]*batch_size
         for step in range(batch_size):
-            batch_deltas[step] = pool.apply_async(Sequential._error_calculation, args=(self.layers, batches_outputs[step], Y[step], loss))
-            
+            workers[step] = pool.apply_async(Sequential._error_calculation, args=(i, self.layers, batches_outputs[step], Y[step], loss))
+        
+        # Here we don't care about return order actually
         deltas = np.array([np.zeros(self.layers[l].getW().shape[1]+1) for l in range(len(self.layers))])
         for step in range(batch_size):
-            deltas += batch_deltas[step].get()
+            deltas += workers[step].get()
             
         # Entrainement
         for l in range(len(self.layers)):
@@ -578,7 +593,8 @@ class Sequential:
         Xval = np.array(X[ntrain:])
         Yval = np.array(Y[ntrain:])
         optimizer.init(self.layers)
-        pool = Pool(4)
+        pool = Pool(batch_size)
+        #pool = Pool(min(int(cpu_count()*1.5), batch_size))
         if not(resume) or self.last_epoch == 0:
             self.best_epoch = 0
             self.counter_since_best = 0
@@ -613,7 +629,7 @@ class Sequential:
                     
                     dt = (time.time_ns() - t0)/1e9
                     
-                    print("\r\t => Batch {}/{} - {} batch/s".format(batch+1, num_batch, np.round(1/dt, decimals=3)), end=" "*10)
+                    print("\r\t => Batch {}/{} - {} batch/s - loss : {}".format(batch+1, num_batch, np.round(1/dt, decimals=3), np.mean(self.losses[-batch_size:])), end=" "*10)
                 
                 print("")
                 
@@ -674,6 +690,9 @@ class Sequential:
                 del(self.history['epoch'][self.best_epoch+1:])
                 
                 break
+            
+        pool.close()
+        pool.join()
         
     def plot_history(self, logarithmic_scale=False):
         import matplotlib.pyplot as plt
